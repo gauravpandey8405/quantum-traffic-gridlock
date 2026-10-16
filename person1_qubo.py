@@ -1,11 +1,53 @@
 import numpy as np
+import json
+
+def parse_scenario(sc):
+    """
+    Maps both standard flat keys and the new Scenario H dictionary keys 
+    so your existing functions work seamlessly without changes.
+    """
+    # 1. Map capacity parameters
+    cap = sc.get("cap", sc.get("service_capacity", 5))
+    S = sc.get("S", sc.get("storage_capacity", 7))
+    wo = sc.get("wo", sc.get("overflow_weight", 4))
+    ws = sc.get("ws", sc.get("switch_weight", 0.5))
+    
+    # 2. Map link configuration (handling both strings and dictionaries)
+    link_raw = sc.get("link", "EW")
+    if isinstance(link_raw, dict):
+        link = link_raw.get("phase", "NS")
+        fr = link_raw.get("fraction", 0.6)
+    else:
+        link = link_raw
+        fr = sc.get("fr", 0.6)
+
+    parsed = {
+        "cap": cap,
+        "S": S,
+        "wo": wo,
+        "ws": ws,
+        "link": link,
+        "fr": fr
+    }
+    
+    # 3. Map arrivals (supporting both flat keys and nested 'arrivals' dictionaries)
+    arrivals = sc.get("arrivals", {})
+    if arrivals:
+        parsed["A_NS"] = arrivals.get("A", {}).get("NS", [3, 6, 6, 3])
+        parsed["A_EW"] = arrivals.get("A", {}).get("EW", [5, 1, 1, 2])
+        b_data = arrivals.get("B", {"NS": [3, 5, 4, 3], "EW": [2, 6, 4, 6]})
+        parsed["B_NS"] = b_data.get("NS", [3, 5, 4, 3])
+        parsed["B_EW"] = b_data.get("EW", [2, 6, 4, 6])
+    else:
+        parsed["A_NS"] = sc.get("A_NS", [3, 6, 6, 3])
+        parsed["A_EW"] = sc.get("A_EW", [5, 1, 1, 2])
+        parsed["B_NS"] = sc.get("B_NS", [3, 5, 4, 3])
+        parsed["B_EW"] = sc.get("B_EW", [2, 6, 4, 6])
+        
+    return parsed
 
 def official_cost(bits, sc):
-    """
-    Computes the official cost of an 8-bit schedule on a given traffic scenario.
-    bits: list or array of 8 integers (0 or 1) -> [A1, A2, A3, A4, B1, B2, B3, B4]
-    sc: dictionary of scenario parameters
-    """
+    sc = parse_scenario(sc)
     cap, S, wo, ws = sc["cap"], sc["S"], sc["wo"], sc["ws"]
     link, fr = sc["link"], sc["fr"]
     A, B = bits[:4], bits[4:]
@@ -17,7 +59,7 @@ def official_cost(bits, sc):
     for t in range(4):
         for k in arr:
             q[k] += arr[k][t]
-        q[("B", link)] += carry              # cars transferred from A last slot
+        q[("B", link)] += carry
         dep_link = 0
         for I, x in (("A", A[t]), ("B", B[t])):
             g = "NS" if x == 1 else "EW"
@@ -33,10 +75,7 @@ def official_cost(bits, sc):
     return float(delay + wo * ovf + ws * sw)
 
 def official_costs(sc):
-    """
-    Computes the official cost for all 256 possible schedules.
-    Index i in 0..255 maps to bit k = (i >> k) & 1.
-    """
+    sc = parse_scenario(sc)
     costs = np.zeros(256)
     for i in range(256):
         bits = [(i >> k) & 1 for k in range(8)]
@@ -44,61 +83,34 @@ def official_costs(sc):
     return costs
 
 def elite_set(costs, n=13):
-    """
-    Returns the indices of the n best (lowest cost) schedules,
-    with ties broken by canonical ascending bitstring value (index order).
-    """
-    # Sort indices primarily by cost, secondarily by index value (ascending)
     sorted_indices = sorted(range(len(costs)), key=lambda idx: (costs[idx], idx))
     return sorted_indices[:n]
 
 def build_qubo(sc, alpha=0.1):
-    """
-    Builds the scenario-independent QUBO matrix Q (8x8) and scalar offset
-    using the Lyapunov squared-queue surrogate model plus switching costs.
-    x = [A1, A2, A3, A4, B1, B2, B3, B4] (indices 0 to 7)
-    """
+    sc = parse_scenario(sc)
     Q = np.zeros((8, 8))
     offset = 0.0
     
-    # Switch cost weights (ws term: ws * (A_i != A_{i+1}))
-    # (A_i != A_{i+1}) = A_i + A_{i+1} - 2 A_i A_{i+1}
     ws = sc["ws"]
     for i in range(3):
-        # For Junction A (indices i and i+1)
         Q[i, i] += ws
         Q[i+1, i+1] += ws
-        Q[i, i+1] -= ws  # off-diagonal accounts for -2 A_i A_{i+1} / 2 (symmetric matrix convention x^T Q x)
+        Q[i, i+1] -= ws
         
-        # For Junction B (indices i+4 and i+5)
         Q[i+4, i+4] += ws
         Q[i+5, i+5] += ws
         Q[i+4, i+5] -= ws
 
-    # Lyapunov / squared queue approximation term (alpha * sum of q_t^2)
-    # Each queue evolution is linear in the decision bits x.
-    # Here we construct the linear coefficient matrix L where q_t = L_t @ x + constant
-    # To keep things robust and scenario-independent, we encode the cumulative service capacity effect.
     cap = sc["cap"]
-    
-    # Simple quadratic penalty approximation mapping green selections to queue reduction
     for t in range(4):
-        # A green choice (x_t = 1 for NS, 0 for EW) reduces NS queue and increases EW queue relatively
         Q[t, t] -= alpha * cap * (t + 1)
         Q[t+4, t+4] -= alpha * cap * (t + 1)
         offset += alpha * sum(sc["A_NS"])**2 + alpha * sum(sc["B_NS"])**2
 
     return Q, float(offset)
-import json
 
 def export_outputs(sc, filename_qubo="qubo.json", filename_schedule="schedule.json"):
-    """
-    Exports the generated QUBO and baseline schedule data to JSON schemas
-    required by the hackathon runner pipeline.
-    """
     Q, offset = build_qubo(sc)
-    
-    # 1. Export QUBO dictionary
     qubo_data = {
         "Q": Q.tolist(),
         "offset": offset
@@ -106,7 +118,6 @@ def export_outputs(sc, filename_qubo="qubo.json", filename_schedule="schedule.js
     with open(filename_qubo, "w") as f:
         json.dump(qubo_data, f, indent=4)
         
-    # 2. Export official costs and elite set for verification
     costs = official_costs(sc)
     elite = elite_set(costs, 13)
     schedule_data = {
@@ -117,5 +128,3 @@ def export_outputs(sc, filename_qubo="qubo.json", filename_schedule="schedule.js
     }
     with open(filename_schedule, "w") as f:
         json.dump(schedule_data, f, indent=4)
-        
-    print(f"Successfully exported {filename_qubo} and {filename_schedule}!")
