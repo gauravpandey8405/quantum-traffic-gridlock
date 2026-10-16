@@ -11,3 +11,6 @@ Team Submission for IBM Qiskit Fall Fest 2026
 ## Running the Pipeline
 Run the runnable pipeline using the required CLI arguments:
 python run.py --scenario scenario_R.json --seed 42 --out ./
+
+## Repository Link
+[GitHub Repository: Quantum Traffic Gridlock](https://github.com/gauravpandey8405/quantum-traffic-gridlock)
